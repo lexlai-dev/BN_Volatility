@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::env;
 use std::fs;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -11,33 +10,29 @@ pub struct HistogramConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct MonitorConfig {
-    // 敏感信息（从 .env 加载，不包含在 YAML 中）
-    #[serde(skip)]
-    pub webhook_url: String,
+    // Maps directly to 'slack_webhook_url' in the YAML file.
+    pub slack_webhook_url: String,
 
-    // 策略参数（来自 YAML）
     pub threshold: f64,
     pub cooldown_secs: u64,
 
-    // 嵌套结构匹配 YAML
     pub histogram: HistogramConfig,
 }
 
 impl MonitorConfig {
+    /// Loads configuration from the 'config.yaml' file in the current working directory.
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        // 1. 加载 .env 文件
-        dotenvy::dotenv().ok();
-
-        // 2. 读取 config.yaml 文件
+        // Attempt to read the file. Ensure 'config.yaml' exists in the root.
         let yaml_content = fs::read_to_string("config.yaml")
-            .expect("Failed to read config.yaml. Please ensure it exists.");
+            .map_err(|_| "❌ Failed to read config.yaml. Make sure the file exists in the root directory.")?;
 
-        // 3. 解析 YAML
-        let mut config: MonitorConfig = serde_yaml::from_str(&yaml_content)?;
+        let config: MonitorConfig = serde_yaml::from_str(&yaml_content)
+            .map_err(|e| format!("❌ Failed to parse config.yaml: {}", e))?;
 
-        // 4. 手动从环境变量注入敏感信息
-        config.webhook_url = env::var("SLACK_WEBHOOK_URL")
-            .expect("SLACK_WEBHOOK_URL must be set in .env file");
+        // validation: Ensure critical fields like the webhook URL are populated.
+        if config.slack_webhook_url.is_empty() {
+            return Err("❌ slack_webhook_url in config.yaml is empty!".into());
+        }
 
         Ok(config)
     }

@@ -31,14 +31,4 @@ impl RingBuffer {
     pub fn is_full(&self) -> bool {
         self.data.len() == self.capacity
     }
-
-    // --- 新增：暴露长度方法 ---
-    // pub fn len(&self) -> usize {
-    //     self.data.len()
-    // }
-    // 
-    // // --- 新增：暴露容量（对应 Python 的 length 属性） ---
-    // pub fn capacity(&self) -> usize {
-    //     self.capacity
-    // }
 }

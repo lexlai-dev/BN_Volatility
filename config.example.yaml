@@ -1,0 +1,13 @@
+# Strategy Alert Parameters
+threshold: 40.0        # Annualized volatility threshold for alerts (%)
+cooldown_secs: 60      # Alert cooldown period in seconds
+
+# Histogram Statistics Parameters
+histogram:
+  interval: 21600      # Reporting interval in seconds (21600s = 6 hours)
+  step: 0.01           # Bucket step size (0.01 = 1%)
+  buckets: 200         # Total number of buckets
+
+# Webhook Configuration
+# Replace the URL below with your actual Slack Webhook URL.
+slack_webhook_url: "https://hooks.slack.com/services/YOUR/REAL/WEBHOOK"

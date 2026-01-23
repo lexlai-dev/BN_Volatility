@@ -12,67 +12,76 @@ use crate::stats::VolatilityStats;
 use crate::models::AggTrade;
 
 use chrono::{Local, TimeZone};
-use futures_util::{StreamExt, SinkExt};
+use futures_util::{SinkExt, StreamExt};
 use tokio::time::{sleep, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use log::{info, warn, error, debug};
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    // Initialize logging subsystem. Defaults to "info" level if RUST_LOG is not set.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // 1. Load configuration ONCE at startup.
+    // If this fails, we exit immediately because the application cannot function without config.
+    let cfg = match MonitorConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("❌ Critical Error: Failed to load configuration: {}", e);
+            return; // Exit the application
+        }
+    };
+
+    // Initialize volatility calculator (window size: 30, sampling interval: 15).
+    // Defined outside the loop to preserve state across reconnections.
     let mut vol_calc = InstantVolatilityIndicator::new(30, 15);
 
     loop {
-        println!("🚀 Connecting to BN WebSocket...");
-        if let Err(e) = run_connection(&mut vol_calc).await {
-            eprintln!("⚠️ Connection error: {:?}. Retrying in 5s...", e);
+        info!("🚀 Starting Binance Volatility Monitor...");
+
+        // 2. Pass the configuration by reference (&cfg) to the connection handler.
+        if let Err(e) = run_connection(&mut vol_calc, &cfg).await {
+            error!("⚠️ Connection lost: {:?}. Retrying in 5s...", e);
         }
+
         sleep(Duration::from_secs(5)).await;
     }
 }
 
-async fn run_connection(vol_calc: &mut InstantVolatilityIndicator) -> Result<(), Box<dyn std::error::Error>> {
-    // --- 1. 加载配置 (混合模式) ---
-    // 这里只在连接建立时加载一次。如果需要修改参数，重启程序即可。
-    // cfg 包含了：
-    // - webhook_url (来自 .env)
-    // - threshold, cooldown_secs (来自 yaml)
-    // - histogram { interval, step, buckets } (来自 yaml)
-    let cfg = MonitorConfig::load()?;
+async fn run_connection(
+    vol_calc: &mut InstantVolatilityIndicator,
+    cfg: &MonitorConfig // Receives config as a reference
+) -> Result<(), Box<dyn std::error::Error>> {
 
-    // --- 2. 初始化组件 ---
-    // 使用 YAML 配置初始化直方图统计器
+    // Initialize statistics using parameters from the loaded config.
     let mut stats = VolatilityStats::new(cfg.histogram.step, cfg.histogram.buckets);
 
-    // 计时器
     let mut last_hist_time = Instant::now();
     let mut last_alert_time: Option<Instant> = None;
 
-    // --- 3. 建立 WebSocket 连接 ---
+    // Establish WebSocket connection to Binance Futures AggTrade stream.
     let url = "wss://fstream.binance.com/ws/btcusdt@aggTrade";
     let (ws_stream, _) = connect_async(url).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    println!("✅ Connected to Binance (Threshold: {:.1}%, Hist Interval: {}s)",
+    info!("✅ Connected to Binance (Threshold: {:.1}%, Hist Interval: {}s)",
              cfg.threshold, cfg.histogram.interval);
 
-    // --- 4. 聚合状态变量 ---
+    // State variables for millisecond-level VWAP aggregation.
     let mut current_ms: Option<i64> = None;
     let mut sum_pv = 0.0;
     let mut sum_v = 0.0;
 
-    // --- 5. 消息主循环 ---
     while let Some(message) = read.next().await {
 
-        // [直方图报告逻辑]
-        // 检查是否达到 YAML 中配置的 interval 时间
+        // --- Periodic Histogram Reporting ---
         if last_hist_time.elapsed().as_secs() >= cfg.histogram.interval {
-            // 生成报告 (传入分钟数用于显示)
             let report = stats.generate_report(cfg.histogram.interval / 60);
+            notifier::send_histogram_report(cfg.slack_webhook_url.clone(), report);
 
-            // 发送 (使用来自 .env 的 webhook_url)
-            notifier::send_histogram_report(cfg.webhook_url.clone(), report);
+            info!("📊 Histogram report sent.");
 
-            // 重置统计器 (使用 YAML 中的 step 和 buckets)
+            // Reset statistics for the next interval.
             stats = VolatilityStats::new(cfg.histogram.step, cfg.histogram.buckets);
             last_hist_time = Instant::now();
         }
@@ -82,13 +91,11 @@ async fn run_connection(vol_calc: &mut InstantVolatilityIndicator) -> Result<(),
             Message::Text(text_bytes) => {
                 let text = text_bytes.as_str();
 
-                // 使用 models::AggTrade 解析
                 if let Ok(trade) = serde_json::from_str::<AggTrade>(text) {
                     let p: f64 = trade.price.parse()?;
                     let q: f64 = trade.quantity.parse()?;
                     let trade_ms = trade.event_time;
 
-                    // VWAP 毫秒级聚合
                     match current_ms {
                         None => {
                             current_ms = Some(trade_ms);
@@ -96,35 +103,27 @@ async fn run_connection(vol_calc: &mut InstantVolatilityIndicator) -> Result<(),
                             sum_v = q;
                         }
                         Some(ms) if ms == trade_ms => {
+                            // Accumulate volume and PV for the same millisecond.
                             sum_pv += p * q;
                             sum_v += q;
                         }
                         Some(ms) => {
-                            // 时间戳跳变，结算上一毫秒
+                            // Timestamp changed: Finalize the previous millisecond logic.
                             if sum_v > 0.0 {
+                                // Calculate Volume Weighted Average Price (VWAP) to reduce noise.
                                 let vwap_p = sum_pv / sum_v;
                                 vol_calc.add_sample(vwap_p.ln(), ms as f64 / 1000.0);
 
                                 if vol_calc.is_sampling_buffer_full() {
                                     let current_vol = vol_calc.current_value();
-
-                                    // 记录到直方图
                                     stats.record(current_vol);
 
-                                    // 仅在 Dev 模式下打印每毫秒数据，Release 模式下静默
-                                    #[cfg(debug_assertions)]
-                                    println!(
-                                        "[{}] Vol: {:.4}%",
-                                        Local.timestamp_millis_opt(ms).unwrap().format("%H:%M:%S%.3f"),
-                                        current_vol * 100.0
-                                    );
+                                    // Debug log visible only when RUST_LOG=debug.
+                                    debug!("Vol: {:.4}% | Price: {:.2}", current_vol * 100.0, vwap_p);
 
-                                    // [预警触发逻辑]
-                                    // 比较 YAML 中的 threshold (注意转换百分比)
+                                    // Check threshold and trigger alert if cooldown period has passed.
                                     if current_vol >= (cfg.threshold / 100.0) {
                                         let now = Instant::now();
-
-                                        // 检查冷却时间 (YAML 中的 cooldown_secs)
                                         let needs_alert = match last_alert_time {
                                             None => true,
                                             Some(last) => now.duration_since(last).as_secs() >= cfg.cooldown_secs,
@@ -132,18 +131,21 @@ async fn run_connection(vol_calc: &mut InstantVolatilityIndicator) -> Result<(),
 
                                         if needs_alert {
                                             notifier::send_slack_alert(
-                                                cfg.webhook_url.clone(),
+                                                cfg.slack_webhook_url.clone(),
                                                 vwap_p,
                                                 current_vol,
                                                 Local.timestamp_millis_opt(ms).unwrap().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
                                                 cfg.threshold
                                             );
+
+                                            warn!("🔥 High Volatility Alert triggered! Vol: {:.2}%", current_vol * 100.0);
+
                                             last_alert_time = Some(now);
                                         }
                                     }
                                 }
                             }
-                            // 开启新的一毫秒
+                            // Reset accumulators for the new millisecond.
                             current_ms = Some(trade_ms);
                             sum_pv = p * q;
                             sum_v = q;
@@ -155,12 +157,11 @@ async fn run_connection(vol_calc: &mut InstantVolatilityIndicator) -> Result<(),
                 write.send(Message::Pong(payload)).await?;
             }
             Message::Close(_) => {
-                println!("收到关闭帧，准备重连...");
+                warn!("Received Close Frame from server.");
                 break;
             }
             _ => (),
         }
     }
-
     Ok(())
 }
