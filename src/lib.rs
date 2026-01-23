@@ -13,7 +13,7 @@ use crate::config::MonitorConfig;
 use crate::stats::VolatilityStats;
 use crate::models::AggTrade;
 
-use chrono::{Local, TimeZone};
+use chrono::{Local, TimeZone, FixedOffset};
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::{Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -86,6 +86,7 @@ pub async fn run_connection(
     // Buffer to store the last 10 completed 1s candles, ensuring we cover the 5s lookback window.
     let mut kline_history: VecDeque<Kline> = VecDeque::with_capacity(10);
 
+    let china_timezone = FixedOffset::east_opt(8 * 3600).unwrap();
     while let Some(message) = read.next().await {
         // --- Periodic Histogram Reporting ---
         if last_hist_time.elapsed().as_secs() >= cfg.histogram.interval {
@@ -170,10 +171,11 @@ pub async fn run_connection(
                                                 // Filter: keep only candles within the last 5 seconds.
                                                 .filter(|k| k.open_time >= target_sec - 5);
 
+
                                             // Find the candle with the maximum absolute price change.
                                             if let Some(max_kline) = candidates.max_by(|a, b| a.change().abs().partial_cmp(&b.change().abs()).unwrap()) {
 
-                                                let kline_time_str = Local.timestamp_opt(max_kline.open_time, 0)
+                                                let kline_time_str = china_timezone.timestamp_opt(max_kline.open_time, 0)
                                                     .unwrap()
                                                     .format("%H:%M:%S")
                                                     .to_string();
