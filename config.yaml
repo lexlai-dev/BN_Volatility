@@ -1,0 +1,9 @@
+# 策略预警参数
+threshold: 50.0        # 年化波动率预警阈值 (%)
+cooldown_secs: 60      # 预警冷却时间 (秒)
+
+# 直方图统计参数
+histogram:
+  interval: 60        # 统计间隔 (秒)
+  step: 0.01           # 步长 (0.01=1%)
+  buckets: 200          # 桶的数量
