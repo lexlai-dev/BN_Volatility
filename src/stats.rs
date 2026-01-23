@@ -30,7 +30,7 @@ impl VolatilityStats {
     }
 
     /// Generates a formatted ASCII histogram report for Slack.
-    /// Uses a sparse approach (skips empty buckets) to keep the message concise.
+    /// Uses a sparse approach (skips empty buckets) and sorts from HIGH to LOW volatility.
     pub fn generate_report(&self, interval_minutes: u64) -> String {
         let total_buckets = self.buckets.len();
 
@@ -43,7 +43,9 @@ impl VolatilityStats {
         );
         let mut has_data = false;
 
-        for i in 0..total_buckets {
+        // 👇Iterate in reverse order (High Volatility -> Low Volatility)
+        // using (0..total_buckets).rev()
+        for i in (0..total_buckets).rev() {
             let count = self.buckets[i];
 
             // Skip buckets with no data to save vertical space.
@@ -86,7 +88,7 @@ impl VolatilityStats {
         if !has_data {
             report.push_str("   (No volatility data recorded in this interval)\n");
         } else {
-            // Footer: Explicitly mention hidden zero-count buckets to avoid ambiguity.
+            // Footer: Explicitly mention hidden zero-count buckets.
             let hidden_count = total_buckets - active_buckets;
             if hidden_count > 0 {
                 report.push_str("\n----------------------------------\n");
