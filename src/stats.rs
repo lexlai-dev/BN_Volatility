@@ -82,7 +82,7 @@ impl VolatilityStats {
             let bar_len = (percentage / 1.0).round() as usize;
             let bar = "█".repeat(bar_len);
 
-            report.push_str(&format!("{} {:<14}: {:<4} ({:.1}%)\n", icon, label, bar, percentage));
+            report.push_str(&format!("{} {:<14}: {:<4} ({:.2}%)\n", icon, label, bar, percentage));
         }
 
         if !has_data {
