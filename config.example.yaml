@@ -11,3 +11,10 @@ histogram:
 # Webhook Configuration
 # Replace the URL below with your actual Slack Webhook URL.
 slack_webhook_url: "https://hooks.slack.com/services/YOUR/REAL/WEBHOOK"
+
+# 趋势监控配置（基于 CVD + VWAP 偏离度）
+trend:
+  enabled: true
+  window_size: 100            # 滑动窗口大小（交易笔数）
+  cvd_threshold: 1.0          # CVD 阈值（净买入/卖出量），单位 BTC
+  vwap_bias_threshold: 0.0002 # VWAP 偏离度阈值（万分之二 = 0.02%）
