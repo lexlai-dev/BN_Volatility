@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -112,13 +113,14 @@ impl InstantVolatilityIndicator {
         let duration_ms = last_ts.saturating_sub(first_ts); // 防止时间戳回退
         let dt_secs = duration_ms as f64 / 1000.0;
 
-        // --- 年化计算 ---
-        let annualized = if dt_secs < 0.001 {
-            0.0
-        } else {
-            raw_vol * (self.seconds_in_year / dt_secs).sqrt()
-        };
+        // // --- 年化计算 ---
+        // let annualized = if dt_secs < 0.001 {
+        //     0.0
+        // } else {
+        //     raw_vol * (self.seconds_in_year / dt_secs).sqrt()
+        // };
 
+        let annualized = raw_vol * (self.seconds_in_year / dt_secs.max(0.001)).sqrt();
         VolatilityResult {
             annualized,
             raw_vol,

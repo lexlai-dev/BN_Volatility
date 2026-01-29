@@ -6,18 +6,22 @@ pub mod config;
 pub mod stats;
 pub mod models;
 pub mod notifier;
+// 【新增】注册遥测模块
+pub mod telemetry;
 
 use crate::indicators::vol::InstantVolatilityIndicator;
 use crate::indicators::trend::{TrendIndicator, TrendState};
 use crate::config::MonitorConfig;
 use crate::stats::VolatilityStats;
 use crate::models::AggTrade;
+// 【新增】引入遥测服务和数据包
+use crate::telemetry::{TelemetryServer, TelemetryPacket};
 
-use chrono::{TimeZone, FixedOffset, Local};
+use chrono::{FixedOffset, Local, TimeZone};
 use futures_util::{SinkExt, StreamExt};
-use tokio::time::{Instant};
+use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 use std::collections::VecDeque;
 
 /// Represents a 1-second Candlestick (Kline) used for visualization in alerts.
@@ -47,8 +51,12 @@ impl Kline {
     /// Updates the current candle with a new trade aggregation.
     fn update(&mut self, price: f64, volume: f64) {
         self.close = price;
-        if price > self.high { self.high = price; }
-        if price < self.low { self.low = price; }
+        if price > self.high {
+            self.high = price;
+        }
+        if price < self.low {
+            self.low = price;
+        }
         self.volume += volume;
     }
 
@@ -62,8 +70,13 @@ impl Kline {
 /// Establishes the WebSocket connection, processes trades, and manages alerts.
 pub async fn run_connection(
     vol_calc: &mut InstantVolatilityIndicator,
-    cfg: &MonitorConfig
+    cfg: &MonitorConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    // 【新增】初始化遥测服务 (可视化开关)
+    // 如果你以后想通过配置控制，可以将 true 换成 cfg.visualization_enabled
+    let visualization_enabled = true;
+    let telemetry = TelemetryServer::new(visualization_enabled, 9001);
 
     let mut stats = VolatilityStats::new(cfg.histogram.step, cfg.histogram.buckets);
 
@@ -72,7 +85,7 @@ pub async fn run_connection(
         cfg.trend.window_size,
         cfg.trend.imbalance_threshold,
         cfg.trend.vwap_bias_threshold,
-        cfg.trend.min_volume
+        cfg.trend.min_volume,
     );
 
     let mut last_hist_time = Instant::now();
@@ -83,8 +96,10 @@ pub async fn run_connection(
     let (ws_stream, _) = connect_async(url).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    info!("✅ Connected to Binance (Threshold: {:.1}%, Hist Interval: {}s)",
-             cfg.threshold, cfg.histogram.interval);
+    info!(
+        "✅ Connected to Binance (Threshold: {:.1}%, Hist Interval: {}s)",
+        cfg.threshold, cfg.histogram.interval
+    );
 
     // State variables for 1-second Kline synthesis.
     let mut current_kline: Option<Kline> = None;
@@ -92,6 +107,7 @@ pub async fn run_connection(
     let mut kline_history: VecDeque<Kline> = VecDeque::with_capacity(10);
 
     let china_timezone = FixedOffset::east_opt(8 * 3600).unwrap();
+
     while let Some(message) = read.next().await {
         // --- Periodic Histogram Reporting ---
         if last_hist_time.elapsed().as_secs() >= cfg.histogram.interval {
@@ -102,7 +118,14 @@ pub async fn run_connection(
             last_hist_time = Instant::now();
         }
 
-        let msg = message?;
+        let msg = match message {
+            Ok(m) => m,
+            Err(e) => {
+                error!("WebSocket Error: {:?}", e);
+                return Err(Box::new(e));
+            }
+        };
+
         match msg {
             Message::Text(text_bytes) => {
                 let text = text_bytes.as_str();
@@ -113,17 +136,16 @@ pub async fn run_connection(
                     let trade_ms = trade.event_time;
                     let trade_sec = trade_ms / 1000;
 
-
                     // --- Trend Detection (CVD + VWAP) ---
                     let mut trend_state = TrendState::Neutral;
                     let mut flow_imbalance = 0.0;
                     let mut vwap_bias = 0.0;
-                    
+
                     if cfg.trend.enabled {
                         trend_state = trend_calc.update(&trade);
                         let metrics = trend_calc.get_metrics(p);
                         flow_imbalance = metrics.0;
-                        // metrics.1 是 vwap，当前 debug 打印中未使用
+                        // metrics.1 是 vwap
                         vwap_bias = metrics.2;
 
                         // 只在检测到非中性趋势时报警
@@ -131,7 +153,9 @@ pub async fn run_connection(
                             let now = Instant::now();
                             let needs_alert = match last_trend_alert_time {
                                 None => true,
-                                Some(last) => now.duration_since(last).as_secs() >= cfg.cooldown_secs,
+                                Some(last) => {
+                                    now.duration_since(last).as_secs() >= cfg.cooldown_secs
+                                }
                             };
 
                             if needs_alert {
@@ -143,8 +167,10 @@ pub async fn run_connection(
                                 };
 
                                 let time_str = china_timezone
-                                    .timestamp_opt(trade_sec, 0).unwrap()
-                                    .format("%H:%M:%S").to_string();
+                                    .timestamp_opt(trade_sec, 0)
+                                    .unwrap()
+                                    .format("%H:%M:%S")
+                                    .to_string();
 
                                 notifier::send_trend_alert(
                                     cfg.slack_webhook_url.clone(),
@@ -154,17 +180,25 @@ pub async fn run_connection(
                                     vwap_bias,
                                     p,
                                     trend_calc.trade_count(),
-                                    time_str
+                                    time_str,
                                 );
 
-                                let direction_cn = if trend_state == TrendState::Bullish { "看涨" } else { "看跌" };
-                                warn!("🌊 Trend Alert! {} | Imbalance: {:.2}% | VWAP Bias: {:.4}%",
-                                      direction_cn, flow_imbalance * 100.0, vwap_bias * 100.0);
-                                
+                                let direction_cn = if trend_state == TrendState::Bullish {
+                                    "看涨"
+                                } else {
+                                    "看跌"
+                                };
+                                warn!(
+                                    "🌊 Trend Alert! {} | Imbalance: {:.2}% | VWAP Bias: {:.4}%",
+                                    direction_cn,
+                                    flow_imbalance * 100.0,
+                                    vwap_bias * 100.0
+                                );
+
                                 // Debug: 打印窗口内交易数据到 console
-                                #[cfg(debug_assertions)]
-                                trend_calc.debug_dump_trades();
-                                
+                                // #[cfg(debug_assertions)]
+                                // trend_calc.debug_dump_trades();
+
                                 last_trend_alert_time = Some(now);
                             }
                         }
@@ -195,10 +229,31 @@ pub async fn run_connection(
                     // --- Volatility Calculation ---
                     // 每笔交易都更新波动率计算器
                     vol_calc.update(p, trade_ms as u64);
-                    
+
                     // 获取波动率结果
                     let vol_result = vol_calc.get_volatility();
-                    
+
+                    // --- 【新增】Telemetry Data Sending ---
+                    let state_val: i8 = match trend_state {
+                        TrendState::Bullish => 1,
+                        TrendState::Bearish => -1,
+                        _ => 0,
+                    };
+
+                    // --- Telemetry Data Sending ---
+                    telemetry.send(TelemetryPacket {
+                        timestamp: trade_ms as u64,
+                        // 去掉了 id
+                        price: p,
+                        quantity: q,
+                        is_buyer_maker: trade.is_buyer_maker,
+
+                        annualized_vol: vol_result.annualized, // 发送年化值
+                        trend_imbalance: flow_imbalance,
+                        vwap_bias: vwap_bias,
+                        trend_state: state_val,
+                    });
+
                     if vol_calc.is_ready() && !vol_result.is_stale {
                         stats.record(vol_result.annualized);
 
@@ -206,18 +261,27 @@ pub async fn run_connection(
                         let signal_time_str = Local::now().format("%H:%M:%S%.3f").to_string();
 
                         // Debug: 合并打印趋势+波动率+时间
-                        #[cfg(debug_assertions)]
-                        println!("[{}] 📊 Vol: {:.2}% (raw:{:.6}, dt:{:.3}s) | Trend: {:?} Imb:{:+.1}% Bias:{:+.4}% | P:{:.2}",
-                                 signal_time_str,
-                                 vol_result.annualized * 100.0, vol_result.raw_vol, vol_result.dt_secs,
-                                 trend_state, flow_imbalance * 100.0, vwap_bias * 100.0, p);
+                        // #[cfg(debug_assertions)]
+                        // println!(
+                        //     "[{}] 📊 Vol: {:.2}% (raw:{:.6}, dt:{:.3}s) | Trend: {:?} Imb:{:+.1}% Bias:{:+.4}% | P:{:.2}",
+                        //     signal_time_str,
+                        //     vol_result.annualized * 100.0,
+                        //     vol_result.raw_vol,
+                        //     vol_result.dt_secs,
+                        //     trend_state,
+                        //     flow_imbalance * 100.0,
+                        //     vwap_bias * 100.0,
+                        //     p
+                        // );
 
                         // --- Alert Logic ---
                         if vol_result.annualized >= (cfg.threshold / 100.0) {
                             let now = Instant::now();
                             let needs_alert = match last_alert_time {
                                 None => true,
-                                Some(last) => now.duration_since(last).as_secs() >= cfg.cooldown_secs,
+                                Some(last) => {
+                                    now.duration_since(last).as_secs() >= cfg.cooldown_secs
+                                }
                             };
 
                             if needs_alert {
@@ -225,14 +289,17 @@ pub async fn run_connection(
                                 let target_sec = trade_sec;
 
                                 // Collect candidates: history + current incomplete candle.
-                                let candidates = kline_history.iter()
+                                let candidates = kline_history
+                                    .iter()
                                     .chain(current_kline.iter())
                                     .filter(|k| k.open_time >= target_sec - 5);
 
                                 // Find the candle with the maximum absolute price change.
-                                if let Some(max_kline) = candidates.max_by(|a, b| a.change().abs().partial_cmp(&b.change().abs()).unwrap()) {
-
-                                    let kline_time_str = china_timezone.timestamp_opt(max_kline.open_time, 0)
+                                if let Some(max_kline) = candidates.max_by(|a, b| {
+                                    a.change().abs().partial_cmp(&b.change().abs()).unwrap()
+                                }) {
+                                    let kline_time_str = china_timezone
+                                        .timestamp_opt(max_kline.open_time, 0)
                                         .unwrap()
                                         .format("%H:%M:%S")
                                         .to_string();
@@ -243,17 +310,19 @@ pub async fn run_connection(
                                         cfg.threshold,
                                         vol_result.raw_vol,
                                         vol_result.dt_secs,
-                                        signal_time_str.clone(),  // 信号产生时间
+                                        signal_time_str.clone(), // 信号产生时间
                                         max_kline.open,
                                         max_kline.close,
                                         max_kline.change(),
                                         max_kline.volume,
-                                        kline_time_str
+                                        kline_time_str,
                                     );
 
-                                    warn!("🔥 Alert! Vol: {:.2}% (raw: {:.6}, dt: {:.3}s), Max 1s Candle: {:.2} ({:.2})",
+                                    warn!(
+                                        "🔥 Alert! Vol: {:.2}% (raw: {:.6}, dt: {:.3}s), Max 1s Candle: {:.2} ({:.2})",
                                         vol_result.annualized * 100.0, vol_result.raw_vol, vol_result.dt_secs,
-                                        max_kline.change(), max_kline.volume);
+                                        max_kline.change(), max_kline.volume
+                                    );
                                 }
 
                                 last_alert_time = Some(now);
