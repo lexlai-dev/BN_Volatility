@@ -7,18 +7,17 @@ pub mod stats;
 pub mod models;
 pub mod notifier;
 
-use crate::indicators::base::TrailingIndicator;
 use crate::indicators::vol::InstantVolatilityIndicator;
 use crate::indicators::trend::{TrendIndicator, TrendState};
 use crate::config::MonitorConfig;
 use crate::stats::VolatilityStats;
 use crate::models::AggTrade;
 
-use chrono::{TimeZone, FixedOffset};
+use chrono::{TimeZone, FixedOffset, Local};
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::{Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{info, warn, debug};
+use tracing::{info, warn};
 use std::collections::VecDeque;
 
 /// Represents a 1-second Candlestick (Kline) used for visualization in alerts.
@@ -71,8 +70,9 @@ pub async fn run_connection(
     // 初始化趋势指标器
     let mut trend_calc = TrendIndicator::new(
         cfg.trend.window_size,
-        cfg.trend.cvd_threshold,
-        cfg.trend.vwap_bias_threshold
+        cfg.trend.imbalance_threshold,
+        cfg.trend.vwap_bias_threshold,
+        cfg.trend.min_volume
     );
 
     let mut last_hist_time = Instant::now();
@@ -85,10 +85,6 @@ pub async fn run_connection(
 
     info!("✅ Connected to Binance (Threshold: {:.1}%, Hist Interval: {}s)",
              cfg.threshold, cfg.histogram.interval);
-
-    let mut current_ms: Option<i64> = None;
-    let mut sum_pv = 0.0;
-    let mut sum_v = 0.0;
 
     // State variables for 1-second Kline synthesis.
     let mut current_kline: Option<Kline> = None;
@@ -117,9 +113,18 @@ pub async fn run_connection(
                     let trade_ms = trade.event_time;
                     let trade_sec = trade_ms / 1000;
 
+
                     // --- Trend Detection (CVD + VWAP) ---
+                    let mut trend_state = TrendState::Neutral;
+                    let mut flow_imbalance = 0.0;
+                    let mut vwap_bias = 0.0;
+                    
                     if cfg.trend.enabled {
-                        let trend_state = trend_calc.update(&trade);
+                        trend_state = trend_calc.update(&trade);
+                        let metrics = trend_calc.get_metrics(p);
+                        flow_imbalance = metrics.0;
+                        // metrics.1 是 vwap，当前 debug 打印中未使用
+                        vwap_bias = metrics.2;
 
                         // 只在检测到非中性趋势时报警
                         if trend_state != TrendState::Neutral {
@@ -130,7 +135,7 @@ pub async fn run_connection(
                             };
 
                             if needs_alert {
-                                let (cvd, vwap, vwap_bias) = trend_calc.get_metrics(p);
+                                let (flow_imbalance, vwap, vwap_bias) = trend_calc.get_metrics(p);
                                 let direction = match trend_state {
                                     TrendState::Bullish => "Bullish",
                                     TrendState::Bearish => "Bearish",
@@ -144,7 +149,7 @@ pub async fn run_connection(
                                 notifier::send_trend_alert(
                                     cfg.slack_webhook_url.clone(),
                                     direction,
-                                    cvd,
+                                    flow_imbalance,
                                     vwap,
                                     vwap_bias,
                                     p,
@@ -153,8 +158,8 @@ pub async fn run_connection(
                                 );
 
                                 let direction_cn = if trend_state == TrendState::Bullish { "看涨" } else { "看跌" };
-                                warn!("🌊 Trend Alert! {} | CVD: {:.4} | VWAP Bias: {:.4}%",
-                                      direction_cn, cvd, vwap_bias * 100.0);
+                                warn!("🌊 Trend Alert! {} | Imbalance: {:.2}% | VWAP Bias: {:.4}%",
+                                      direction_cn, flow_imbalance * 100.0, vwap_bias * 100.0);
                                 
                                 // Debug: 打印窗口内交易数据到 console
                                 #[cfg(debug_assertions)]
@@ -187,80 +192,72 @@ pub async fn run_connection(
                         }
                     }
 
-                    // --- Volatility Calculation (15ms window) ---
-                    match current_ms {
-                        None => {
-                            current_ms = Some(trade_ms);
-                            sum_pv = p * q;
-                            sum_v = q;
-                        }
-                        Some(ms) if ms == trade_ms => {
-                            sum_pv += p * q;
-                            sum_v += q;
-                        }
-                        Some(ms) => {
-                            // Finalize previous millisecond aggregation.
-                            if sum_v > 0.0 {
-                                let vwap_p = sum_pv / sum_v;
-                                vol_calc.add_sample(vwap_p.ln(), ms as f64 / 1000.0);
+                    // --- Volatility Calculation ---
+                    // 每笔交易都更新波动率计算器
+                    vol_calc.update(p, trade_ms as u64);
+                    
+                    // 获取波动率结果
+                    let vol_result = vol_calc.get_volatility();
+                    
+                    if vol_calc.is_ready() && !vol_result.is_stale {
+                        stats.record(vol_result.annualized);
 
-                                if vol_calc.is_sampling_buffer_full() {
-                                    let current_vol = vol_calc.current_value();
-                                    stats.record(current_vol);
+                        // 计算完成时刻（本地时间）
+                        let signal_time_str = Local::now().format("%H:%M:%S%.3f").to_string();
 
-                                    debug!("Vol: {:.4}% | Price: {:.2}", current_vol * 100.0, vwap_p);
+                        // Debug: 合并打印趋势+波动率+时间
+                        #[cfg(debug_assertions)]
+                        println!("[{}] 📊 Vol: {:.2}% (raw:{:.6}, dt:{:.3}s) | Trend: {:?} Imb:{:+.1}% Bias:{:+.4}% | P:{:.2}",
+                                 signal_time_str,
+                                 vol_result.annualized * 100.0, vol_result.raw_vol, vol_result.dt_secs,
+                                 trend_state, flow_imbalance * 100.0, vwap_bias * 100.0, p);
 
-                                    // --- Alert Logic ---
-                                    if current_vol >= (cfg.threshold / 100.0) {
-                                        let now = Instant::now();
-                                        let needs_alert = match last_alert_time {
-                                            None => true,
-                                            Some(last) => now.duration_since(last).as_secs() >= cfg.cooldown_secs,
-                                        };
+                        // --- Alert Logic ---
+                        if vol_result.annualized >= (cfg.threshold / 100.0) {
+                            let now = Instant::now();
+                            let needs_alert = match last_alert_time {
+                                None => true,
+                                Some(last) => now.duration_since(last).as_secs() >= cfg.cooldown_secs,
+                            };
 
-                                        if needs_alert {
-                                            // Identify the 1s candle with the largest body change in the last 5 seconds.
-                                            let target_sec = trade_sec;
+                            if needs_alert {
+                                // Identify the 1s candle with the largest body change in the last 5 seconds.
+                                let target_sec = trade_sec;
 
-                                            // Collect candidates: history + current incomplete candle.
-                                            let candidates = kline_history.iter()
-                                                .chain(current_kline.iter())
-                                                // Filter: keep only candles within the last 5 seconds.
-                                                .filter(|k| k.open_time >= target_sec - 5);
+                                // Collect candidates: history + current incomplete candle.
+                                let candidates = kline_history.iter()
+                                    .chain(current_kline.iter())
+                                    .filter(|k| k.open_time >= target_sec - 5);
 
+                                // Find the candle with the maximum absolute price change.
+                                if let Some(max_kline) = candidates.max_by(|a, b| a.change().abs().partial_cmp(&b.change().abs()).unwrap()) {
 
-                                            // Find the candle with the maximum absolute price change.
-                                            if let Some(max_kline) = candidates.max_by(|a, b| a.change().abs().partial_cmp(&b.change().abs()).unwrap()) {
+                                    let kline_time_str = china_timezone.timestamp_opt(max_kline.open_time, 0)
+                                        .unwrap()
+                                        .format("%H:%M:%S")
+                                        .to_string();
 
-                                                let kline_time_str = china_timezone.timestamp_opt(max_kline.open_time, 0)
-                                                    .unwrap()
-                                                    .format("%H:%M:%S")
-                                                    .to_string();
+                                    notifier::send_slack_alert(
+                                        cfg.slack_webhook_url.clone(),
+                                        vol_result.annualized,
+                                        cfg.threshold,
+                                        vol_result.raw_vol,
+                                        vol_result.dt_secs,
+                                        signal_time_str.clone(),  // 信号产生时间
+                                        max_kline.open,
+                                        max_kline.close,
+                                        max_kline.change(),
+                                        max_kline.volume,
+                                        kline_time_str
+                                    );
 
-                                                notifier::send_slack_alert(
-                                                    cfg.slack_webhook_url.clone(),
-                                                    current_vol,
-                                                    cfg.threshold,
-                                                    // Pass Kline data for visual verification.
-                                                    max_kline.open,
-                                                    max_kline.close,
-                                                    max_kline.change(),
-                                                    max_kline.volume,
-                                                    kline_time_str
-                                                );
-
-                                                warn!("🔥 Alert! Vol: {:.2}%, Max 1s Candle: {:.2} ({:.2})",
-                                                    current_vol * 100.0, max_kline.change(), max_kline.volume);
-                                            }
-
-                                            last_alert_time = Some(now);
-                                        }
-                                    }
+                                    warn!("🔥 Alert! Vol: {:.2}% (raw: {:.6}, dt: {:.3}s), Max 1s Candle: {:.2} ({:.2})",
+                                        vol_result.annualized * 100.0, vol_result.raw_vol, vol_result.dt_secs,
+                                        max_kline.change(), max_kline.volume);
                                 }
+
+                                last_alert_time = Some(now);
                             }
-                            current_ms = Some(trade_ms);
-                            sum_pv = p * q;
-                            sum_v = q;
                         }
                     }
                 }

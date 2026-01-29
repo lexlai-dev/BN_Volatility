@@ -8,13 +8,20 @@ histogram:
   step: 0.01           # Bucket step size (0.01 = 1%)
   buckets: 200         # Total number of buckets
 
+# 波动率计算配置
+volatility:
+  window_size: 30           # 采样窗口大小（数据点数量）
+  stale_threshold_ms: 5000  # 僵尸数据阈值（毫秒），5000 = 5秒无数据视为断流
+  fallback_volatility: 0.5  # 数据过期时返回的防御性波动率，0.5 = 50%
+
 # Webhook Configuration
 # Replace the URL below with your actual Slack Webhook URL.
 slack_webhook_url: "https://hooks.slack.com/services/YOUR/REAL/WEBHOOK"
 
-# 趋势监控配置（基于 CVD + VWAP 偏离度）
+# 趋势监控配置（基于 Order Flow Imbalance + VWAP 偏离度）
 trend:
   enabled: true
   window_size: 100            # 滑动窗口大小（交易笔数）
-  cvd_threshold: 1.0          # CVD 阈值（净买入/卖出量），单位 BTC
-  vwap_bias_threshold: 0.0002 # VWAP 偏离度阈值（万分之二 = 0.02%）
+  imbalance_threshold: 0.15   # Order Flow Imbalance 阈值，0.15 = 净买入占比 > 15%
+  vwap_bias_threshold: 0.0003 # VWAP 偏离度阈值（万分之三 = 0.03%）
+  min_volume: 0.01            # 最小成交量过滤（BTC），防止冷清时噪音

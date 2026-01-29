@@ -5,8 +5,11 @@ use tracing::{info, error};
 /// Displays the largest 1-second candle movement observed in the last 5 seconds.
 pub fn send_slack_alert(
     webhook_url: String,
-    vol: f64,
+    vol: f64,           // 年化波动率
     threshold: f64,
+    raw_vol: f64,       // 原始 RMS
+    dt_secs: f64,       // 时间窗口（秒）
+    signal_time: String, // 信号产生时间
     // K line data
     k_open: f64,
     k_close: f64,
@@ -22,14 +25,18 @@ pub fn send_slack_alert(
 
     let message = format!(
         "🚨 *BTC High Volatility Alert* 🚨\n\
+        > *Signal Time*: `{}`\n\
         > *Volatility*: *{:.2}%* (Threshold: {}%)\n\
+        > *Raw RMS*: `{:.6}` | *Window*: `{:.3}s`\n\
         > --------------------------------\n\
         > *🕯️ Max 1s Candle (Past 5s)*:\n\
         > *Time*: `{} (1s)`\n\
         > *Open*: `${:.2}`  ➡  *Close*: `${:.2}`\n\
         > *Change*: {} `{}{:.2}` (`{}{:.3}%`)\n\
         > *Volume*: `{:.4} BTC`",
+        signal_time,
         vol * 100.0, threshold,
+        raw_vol, dt_secs,
         k_time_str,
         k_open, k_close,
         arrow, sign, k_change, sign, pct_change,
@@ -54,11 +61,11 @@ pub fn send_histogram_report(webhook_url: String, report: String) {
     });
 }
 
-/// Sends a trend alert to Slack based on CVD + VWAP analysis.
+/// Sends a trend alert to Slack based on Order Flow Imbalance + VWAP analysis.
 pub fn send_trend_alert(
     webhook_url: String,
     trend_direction: &str,  // "Bullish" or "Bearish"
-    cvd: f64,               // Cumulative Volume Delta
+    flow_imbalance: f64,    // Order Flow Imbalance (-1.0 to +1.0)
     vwap: f64,              // Volume Weighted Average Price
     vwap_bias: f64,         // VWAP deviation percentage
     current_price: f64,
@@ -73,21 +80,21 @@ pub fn send_trend_alert(
         _ => ("➡️", "中性"),
     };
 
-    let cvd_sign = if cvd >= 0.0 { "+" } else { "" };
+    let imbalance_sign = if flow_imbalance >= 0.0 { "+" } else { "" };
     let bias_sign = if vwap_bias >= 0.0 { "+" } else { "" };
 
     let message = format!(
         "{} *BTC Trend Alert* {}\n\
         > *检测到{}趋势*\n\
         > --------------------------------\n\
-        > *CVD*: `{}{:.4} BTC` (净{})\n\
+        > *资金流向*: `{}{:.2}%` (净{})\n\
         > *VWAP*: `${:.2}`\n\
         > *当前价*: `${:.2}` (`{}{:.4}%` 偏离)\n\
         > *窗口*: 最近 `{}` 笔交易\n\
         > *时间*: `{}`",
         arrow, arrow,
         direction_cn,
-        cvd_sign, cvd, if cvd >= 0.0 { "买入" } else { "卖出" },
+        imbalance_sign, flow_imbalance * 100.0, if flow_imbalance >= 0.0 { "买入" } else { "卖出" },
         vwap,
         current_price, bias_sign, vwap_bias * 100.0,
         trade_count,

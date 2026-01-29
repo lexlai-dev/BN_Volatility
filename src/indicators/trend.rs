@@ -27,8 +27,12 @@ pub struct TrendIndicator {
     sum_vol: f64,
 
     // --- 阈值配置 ---
-    cvd_threshold: f64,
+    // Order Flow Imbalance 阈值，例如 0.15 表示净买入占比 > 15%
+    imbalance_threshold: f64,
+    // VWAP 偏离度阈值，例如 0.0003 表示万分之三
     vwap_bias_threshold: f64,
+    // 最小成交量过滤，防止冷清时产生噪音信号
+    min_volume: f64,
 }
 
 // 内部使用的简化结构，存我们需要的数据即可
@@ -39,7 +43,7 @@ struct TradeData {
 }
 
 impl TrendIndicator {
-    pub fn new(window_size: usize, cvd_threshold: f64, vwap_bias_threshold: f64) -> Self {
+    pub fn new(window_size: usize, imbalance_threshold: f64, vwap_bias_threshold: f64, min_volume: f64) -> Self {
         Self {
             window_size,
             trades: VecDeque::with_capacity(window_size),
@@ -47,8 +51,9 @@ impl TrendIndicator {
             sum_sell_vol: 0.0,
             sum_price_vol: 0.0,
             sum_vol: 0.0,
-            cvd_threshold,
+            imbalance_threshold,
             vwap_bias_threshold,
+            min_volume,
         }
     }
 
@@ -93,21 +98,24 @@ impl TrendIndicator {
     }
 
     fn calculate_trend(&self, current_price: f64) -> TrendState {
-        if self.sum_vol == 0.0 {
+        // 最小成交量过滤：防止在极度冷清时产生噪音信号
+        if self.sum_vol < self.min_volume {
             return TrendState::Neutral;
         }
 
-        // --- 指标 A: CVD (净买入量) ---
-        let net_volume = self.sum_buy_vol - self.sum_sell_vol;
+        // --- 指标 A: Order Flow Imbalance (相对比例) ---
+        // 范围: -1.0 (全卖) 到 +1.0 (全买)
+        let net_vol = self.sum_buy_vol - self.sum_sell_vol;
+        let flow_imbalance = net_vol / self.sum_vol;
         
-        // --- 指标 B: VWAP ---
+        // --- 指标 B: VWAP 偏离度 ---
         let vwap = self.sum_price_vol / self.sum_vol;
-        let vwap_bias = (current_price - vwap) / vwap; // 偏离百分比
+        let vwap_bias = (current_price - vwap) / vwap;
 
-        // --- 融合策略：使用配置的阈值 ---
-        if net_volume > self.cvd_threshold && vwap_bias > self.vwap_bias_threshold {
+        // --- 融合策略：资金流向 + 价格位置 共振 ---
+        if flow_imbalance > self.imbalance_threshold && vwap_bias > self.vwap_bias_threshold {
             TrendState::Bullish
-        } else if net_volume < -self.cvd_threshold && vwap_bias < -self.vwap_bias_threshold {
+        } else if flow_imbalance < -self.imbalance_threshold && vwap_bias < -self.vwap_bias_threshold {
             TrendState::Bearish
         } else {
             TrendState::Neutral
@@ -115,11 +123,13 @@ impl TrendIndicator {
     }
 
     /// 获取当前指标值，用于报警时展示
+    /// 返回: (flow_imbalance, vwap, vwap_bias)
     pub fn get_metrics(&self, current_price: f64) -> (f64, f64, f64) {
-        let cvd = self.sum_buy_vol - self.sum_sell_vol;
+        let net_vol = self.sum_buy_vol - self.sum_sell_vol;
+        let flow_imbalance = if self.sum_vol > 0.0 { net_vol / self.sum_vol } else { 0.0 };
         let vwap = if self.sum_vol > 0.0 { self.sum_price_vol / self.sum_vol } else { current_price };
         let vwap_bias = if vwap > 0.0 { (current_price - vwap) / vwap } else { 0.0 };
-        (cvd, vwap, vwap_bias)
+        (flow_imbalance, vwap, vwap_bias)
     }
 
     /// 获取窗口内的交易笔数
@@ -137,8 +147,10 @@ impl TrendIndicator {
             println!("| {:>3} | {:>12.2} | {:>10.6} | {:>6} |", i + 1, t.price, t.quantity, side);
         }
         println!("|-----|--------------|------------|--------|");
-        println!("| SUM | Buy: {:.6} | Sell: {:.6} | CVD: {:.6} |",
-                 self.sum_buy_vol, self.sum_sell_vol, self.sum_buy_vol - self.sum_sell_vol);
+        let net_vol = self.sum_buy_vol - self.sum_sell_vol;
+        let imbalance = if self.sum_vol > 0.0 { net_vol / self.sum_vol } else { 0.0 };
+        println!("| Buy: {:.6} | Sell: {:.6} | Imbalance: {:.2}% |",
+                 self.sum_buy_vol, self.sum_sell_vol, imbalance * 100.0);
         let vwap = if self.sum_vol > 0.0 { self.sum_price_vol / self.sum_vol } else { 0.0 };
         println!("| VWAP: {:.2} | Total Vol: {:.6} |", vwap, self.sum_vol);
         println!("==========================================");

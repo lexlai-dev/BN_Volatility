@@ -8,13 +8,22 @@ pub struct HistogramConfig {
     pub buckets: usize,
 }
 
-/// 趋势监控配置（基于 CVD + VWAP 偏离度）
+/// 波动率计算配置
+#[derive(Debug, Deserialize, Clone)]
+pub struct VolatilityConfig {
+    pub window_size: usize,         // 采样窗口大小（数据点数量），例如 30
+    pub stale_threshold_ms: u64,    // 僵尸数据阈值（毫秒），例如 5000 = 5秒
+    pub fallback_volatility: f64,   // 数据过期时返回的防御性波动率，例如 0.5 = 50%
+}
+
+/// 趋势监控配置（基于 Order Flow Imbalance + VWAP 偏离度）
 #[derive(Debug, Deserialize, Clone)]
 pub struct TrendConfig {
     pub enabled: bool,
-    pub window_size: usize,       // 滑动窗口大小（交易笔数），例如 100
-    pub cvd_threshold: f64,       // CVD 阈值（净买入/卖出量），例如 1.0 BTC
-    pub vwap_bias_threshold: f64, // VWAP 偏离度阈值，例如 0.0002 (万分之二)
+    pub window_size: usize,         // 滑动窗口大小（交易笔数），例如 100
+    pub imbalance_threshold: f64,   // Order Flow Imbalance 阈值，例如 0.15 表示净买入占比 > 15%
+    pub vwap_bias_threshold: f64,   // VWAP 偏离度阈值，例如 0.0003 (万分之三)
+    pub min_volume: f64,            // 最小成交量过滤（BTC），例如 0.01
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -26,6 +35,7 @@ pub struct MonitorConfig {
     pub cooldown_secs: u64,
 
     pub histogram: HistogramConfig,
+    pub volatility: VolatilityConfig,
     pub trend: TrendConfig,
 }
 

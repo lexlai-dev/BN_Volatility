@@ -41,9 +41,13 @@ async fn main() {
         }
     };
 
-    // Initialize the volatility calculator with a 30-sample window and 15ms sampling interval.
+    // Initialize the volatility calculator with config parameters.
     // Instantiated outside the loop to potentially preserve state across reconnections.
-    let mut vol_calc = InstantVolatilityIndicator::new(30, 15);
+    let mut vol_calc = InstantVolatilityIndicator::new(
+        cfg.volatility.window_size,
+        cfg.volatility.stale_threshold_ms,
+        cfg.volatility.fallback_volatility
+    );
 
     loop {
         info!("🚀 Starting Binance Volatility Monitor...");
