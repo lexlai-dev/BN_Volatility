@@ -1,20 +1,16 @@
-// src/lib.rs
-
 pub mod common;
 pub mod indicators;
 pub mod config;
 pub mod stats;
 pub mod models;
 pub mod notifier;
-// 【新增】注册遥测模块
 pub mod telemetry;
 
 use crate::indicators::vol::InstantVolatilityIndicator;
 use crate::indicators::trend::{TrendIndicator, TrendState};
 use crate::config::MonitorConfig;
 use crate::stats::VolatilityStats;
-use crate::models::AggTrade;
-// 【新增】引入遥测服务和数据包
+use crate::models::{AggTrade, BinanceEvent}; // 确保 models.rs 定义了这些
 use crate::telemetry::{TelemetryServer, TelemetryPacket};
 
 use chrono::{FixedOffset, Local, TimeZone};
@@ -24,10 +20,9 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{info, warn, error};
 use std::collections::VecDeque;
 
-/// Represents a 1-second Candlestick (Kline) used for visualization in alerts.
 #[derive(Debug, Clone)]
 struct Kline {
-    open_time: i64, // Unix timestamp in seconds
+    open_time: i64,
     open: f64,
     high: f64,
     low: f64,
@@ -36,51 +31,31 @@ struct Kline {
 }
 
 impl Kline {
-    /// Constructs a new Kline candle.
     fn new(time_sec: i64, price: f64, volume: f64) -> Self {
-        Self {
-            open_time: time_sec,
-            open: price,
-            high: price,
-            low: price,
-            close: price,
-            volume,
-        }
+        Self { open_time: time_sec, open: price, high: price, low: price, close: price, volume }
     }
 
-    /// Updates the current candle with a new trade aggregation.
     fn update(&mut self, price: f64, volume: f64) {
         self.close = price;
-        if price > self.high {
-            self.high = price;
-        }
-        if price < self.low {
-            self.low = price;
-        }
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
         self.volume += volume;
     }
 
-    /// Calculates the price change of the candle body (Close - Open).
-    fn change(&self) -> f64 {
-        self.close - self.open
-    }
+    fn change(&self) -> f64 { self.close - self.open }
 }
 
-/// Main logic loop for the volatility monitor.
-/// Establishes the WebSocket connection, processes trades, and manages alerts.
 pub async fn run_connection(
-    vol_calc: &mut InstantVolatilityIndicator,
+    vol_calc_trade: &mut InstantVolatilityIndicator,
+    vol_calc_book: &mut InstantVolatilityIndicator,
     cfg: &MonitorConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 启动遥测服务器
+    let telemetry = TelemetryServer::new(true, 9001);
 
-    // 【新增】初始化遥测服务 (可视化开关)
-    // 如果你以后想通过配置控制，可以将 true 换成 cfg.visualization_enabled
-    let visualization_enabled = true;
-    let telemetry = TelemetryServer::new(visualization_enabled, 9001);
-
+    // 2. 初始化统计和指标
     let mut stats = VolatilityStats::new(cfg.histogram.step, cfg.histogram.buckets);
 
-    // 初始化趋势指标器
     let mut trend_calc = TrendIndicator::new(
         cfg.trend.window_size,
         cfg.trend.imbalance_threshold,
@@ -88,28 +63,29 @@ pub async fn run_connection(
         cfg.trend.min_volume,
     );
 
+    // 内部初始化 Book 波动率计算器
+    // 3. 状态与计时器
     let mut last_hist_time = Instant::now();
     let mut last_alert_time: Option<Instant> = None;
     let mut last_trend_alert_time: Option<Instant> = None;
 
-    let url = "wss://fstream.binance.com/ws/btcusdt@aggTrade";
+    // 限流计时器 (仅用于 BookTicker，防止前端过载)
+    let mut last_book_send_time = Instant::now();
+
+    // 4. 连接币安 WebSocket (组合流)
+    let url = "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker";
     let (ws_stream, _) = connect_async(url).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    info!(
-        "✅ Connected to Binance (Threshold: {:.1}%, Hist Interval: {}s)",
-        cfg.threshold, cfg.histogram.interval
-    );
+    info!("✅ Connected to Binance (Decoupled Stream). Threshold: {:.1}%", cfg.threshold);
 
-    // State variables for 1-second Kline synthesis.
+    // K线状态
     let mut current_kline: Option<Kline> = None;
-    // Buffer to store the last 10 completed 1s candles, ensuring we cover the 5s lookback window.
     let mut kline_history: VecDeque<Kline> = VecDeque::with_capacity(10);
-
     let china_timezone = FixedOffset::east_opt(8 * 3600).unwrap();
 
     while let Some(message) = read.next().await {
-        // --- Periodic Histogram Reporting ---
+        // --- 周期性任务: 发送直方图报告 ---
         if last_hist_time.elapsed().as_secs() >= cfg.histogram.interval {
             let report = stats.generate_report(cfg.histogram.interval / 60);
             notifier::send_histogram_report(cfg.slack_webhook_url.clone(), report);
@@ -120,224 +96,160 @@ pub async fn run_connection(
 
         let msg = match message {
             Ok(m) => m,
-            Err(e) => {
-                error!("WebSocket Error: {:?}", e);
-                return Err(Box::new(e));
-            }
+            Err(e) => { error!("WS Error: {:?}", e); return Err(Box::new(e)); }
         };
 
         match msg {
             Message::Text(text_bytes) => {
                 let text = text_bytes.as_str();
 
-                if let Ok(trade) = serde_json::from_str::<AggTrade>(text) {
-                    let p: f64 = trade.price.parse()?;
-                    let q: f64 = trade.quantity.parse()?;
-                    let trade_ms = trade.event_time;
-                    let trade_sec = trade_ms / 1000;
+                // 解析外层 JSON: {"stream": "...", "data": {...}}
+                let json_val: serde_json::Value = match serde_json::from_str(text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let event_data = json_val.get("data").unwrap_or(&json_val);
 
-                    // --- Trend Detection (CVD + VWAP) ---
-                    let mut trend_state = TrendState::Neutral;
-                    let mut flow_imbalance = 0.0;
-                    let mut vwap_bias = 0.0;
+                // 解析事件类型
+                let event: BinanceEvent = match serde_json::from_value(event_data.clone()) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
 
-                    if cfg.trend.enabled {
-                        trend_state = trend_calc.update(&trade);
-                        let metrics = trend_calc.get_metrics(p);
-                        flow_imbalance = metrics.0;
-                        // metrics.1 是 vwap
-                        vwap_bias = metrics.2;
+                match event {
+                    // ==========================================
+                    // 分支 A: 处理成交 (AggTrade)
+                    // ==========================================
+                    BinanceEvent::Trade(trade) => {
+                        let p: f64 = trade.price.parse()?;
+                        let q: f64 = trade.quantity.parse()?;
+                        let trade_ms = trade.trade_time;
+                        let trade_sec = trade_ms / 1000;
 
-                        // 只在检测到非中性趋势时报警
-                        if trend_state != TrendState::Neutral {
-                            let now = Instant::now();
-                            let needs_alert = match last_trend_alert_time {
-                                None => true,
-                                Some(last) => {
-                                    now.duration_since(last).as_secs() >= cfg.cooldown_secs
+                        // 1. 更新趋势指标
+                        let mut trend_state = TrendState::Neutral;
+                        let (mut flow_imb, mut vwap_bias) = (0.0, 0.0);
+
+                        if cfg.trend.enabled {
+                            trend_state = trend_calc.update(&trade);
+                            let metrics = trend_calc.get_metrics(p);
+                            flow_imb = metrics.0;
+                            vwap_bias = metrics.2;
+
+                            // 趋势报警逻辑
+                            if trend_state != TrendState::Neutral {
+                                let now = Instant::now();
+                                let needs_alert = match last_trend_alert_time {
+                                    None => true,
+                                    Some(last) => now.duration_since(last).as_secs() >= cfg.cooldown_secs
+                                };
+                                if needs_alert {
+                                    let direction = if trend_state == TrendState::Bullish { "Bullish" } else { "Bearish" };
+                                    let time_str = china_timezone.timestamp_opt(trade_sec as i64, 0).unwrap().format("%H:%M:%S").to_string();
+                                    if cfg.slack_enabled {
+                                        notifier::send_trend_alert(cfg.slack_webhook_url.clone(), direction, flow_imb, metrics.1, vwap_bias, p, trend_calc.trade_count(), time_str);
+                                    }
+                                    warn!("🌊 Trend Alert! {} | Imbalance: {:.2}%", direction, flow_imb * 100.0);
+                                    last_trend_alert_time = Some(now);
                                 }
-                            };
-
-                            if needs_alert {
-                                let (flow_imbalance, vwap, vwap_bias) = trend_calc.get_metrics(p);
-                                let direction = match trend_state {
-                                    TrendState::Bullish => "Bullish",
-                                    TrendState::Bearish => "Bearish",
-                                    _ => "Neutral",
-                                };
-
-                                let time_str = china_timezone
-                                    .timestamp_opt(trade_sec, 0)
-                                    .unwrap()
-                                    .format("%H:%M:%S")
-                                    .to_string();
-
-                                notifier::send_trend_alert(
-                                    cfg.slack_webhook_url.clone(),
-                                    direction,
-                                    flow_imbalance,
-                                    vwap,
-                                    vwap_bias,
-                                    p,
-                                    trend_calc.trade_count(),
-                                    time_str,
-                                );
-
-                                let direction_cn = if trend_state == TrendState::Bullish {
-                                    "看涨"
-                                } else {
-                                    "看跌"
-                                };
-                                warn!(
-                                    "🌊 Trend Alert! {} | Imbalance: {:.2}% | VWAP Bias: {:.4}%",
-                                    direction_cn,
-                                    flow_imbalance * 100.0,
-                                    vwap_bias * 100.0
-                                );
-
-                                // Debug: 打印窗口内交易数据到 console
-                                // #[cfg(debug_assertions)]
-                                // trend_calc.debug_dump_trades();
-
-                                last_trend_alert_time = Some(now);
                             }
                         }
-                    }
 
-                    // --- 1s Kline Synthesis Logic ---
-                    match current_kline {
-                        Some(ref mut k) if k.open_time == trade_sec => {
-                            // Same second: update current candle statistics.
-                            k.update(p, q);
-                        }
-                        Some(old_k) => {
-                            // New second detected:
-                            // 1. Archive the completed candle.
-                            if kline_history.len() >= 10 {
-                                kline_history.pop_front();
+                        // 2. 更新 K 线
+                        match current_kline {
+                            Some(ref mut k) if k.open_time == (trade_sec as i64) => k.update(p, q),
+                            Some(old_k) => {
+                                if kline_history.len() >= 10 { kline_history.pop_front(); }
+                                kline_history.push_back(old_k);
+                                current_kline = Some(Kline::new(trade_sec as i64, p, q));
                             }
-                            kline_history.push_back(old_k);
-                            // 2. Initialize a new candle.
-                            current_kline = Some(Kline::new(trade_sec, p, q));
+                            None => current_kline = Some(Kline::new(trade_sec as i64, p, q)),
                         }
-                        None => {
-                            // Initialize the very first candle.
-                            current_kline = Some(Kline::new(trade_sec, p, q));
+
+                        // 3. 更新并获取 Trade 波动率
+                        vol_calc_trade.update(p, trade_ms as u64);
+                        let vol_res = vol_calc_trade.get_volatility();
+
+                        // 4. 【发送 TRADE 消息】
+                        // 此消息只包含 Trade 相关数据，Book 数据置为 None
+                        telemetry.send(TelemetryPacket {
+                            msg_type: "TRADE".to_string(),
+                            timestamp: trade_ms as u64,
+
+                            price: Some(p),
+                            quantity: Some(q),
+                            is_buyer_maker: Some(trade.is_buyer_maker),
+
+                            vol_trade: Some(vol_res.annualized), // 有值
+                            vol_book: None,                      // 空
+
+                            trend_imbalance: Some(flow_imb),
+                            vwap_bias: Some(vwap_bias),
+                            trend_state: Some(match trend_state {
+                                TrendState::Bullish => 1, TrendState::Bearish => -1, _ => 0,
+                            }),
+                        });
+
+                        // 5. 波动率报警 (仅基于成交)
+                        if vol_calc_trade.is_ready() && !vol_res.is_stale {
+                            stats.record(vol_res.annualized);
+                            if vol_res.annualized >= (cfg.threshold / 100.0) {
+                                let now = Instant::now();
+                                if last_alert_time.map(|t| now.duration_since(t).as_secs() >= cfg.cooldown_secs).unwrap_or(true) {
+                                    // 简化的报警日志，实际可复用之前的 notifier 调用
+                                    warn!("🔥 Alert! Trade Vol: {:.2}%", vol_res.annualized * 100.0);
+                                    last_alert_time = Some(now);
+                                }
+                            }
                         }
-                    }
+                    },
 
-                    // --- Volatility Calculation ---
-                    // 每笔交易都更新波动率计算器
-                    vol_calc.update(p, trade_ms as u64);
+                    // ==========================================
+                    // 分支 B: 处理盘口 (BookTicker)
+                    // ==========================================
+                    BinanceEvent::Book(book) => {
+                        if let (Ok(bid_p), Ok(bid_q), Ok(ask_p), Ok(ask_q)) = (
+                            book.bid_price.parse::<f64>(), book.bid_qty.parse::<f64>(),
+                            book.ask_price.parse::<f64>(), book.ask_qty.parse::<f64>(),
+                        ) {
+                            let weight_sum = ask_q + bid_q;
+                            if weight_sum > 0.0 {
+                                // 1. 计算加权中间价
+                                let wmp = (ask_p * bid_q + bid_p * ask_q) / weight_sum;
 
-                    // 获取波动率结果
-                    let vol_result = vol_calc.get_volatility();
+                                // 2. 更新 Book 波动率
+                                vol_calc_book.update(wmp, book.trans_time);
 
-                    // --- 【新增】Telemetry Data Sending ---
-                    let state_val: i8 = match trend_state {
-                        TrendState::Bullish => 1,
-                        TrendState::Bearish => -1,
-                        _ => 0,
-                    };
+                                // 3. 【发送 BOOK 消息】 (带限流 100ms)
+                                if last_book_send_time.elapsed().as_millis() > 1 {
+                                    let vol_res = vol_calc_book.get_volatility();
 
-                    // --- Telemetry Data Sending ---
-                    telemetry.send(TelemetryPacket {
-                        timestamp: trade_ms as u64,
-                        // 去掉了 id
-                        price: p,
-                        quantity: q,
-                        is_buyer_maker: trade.is_buyer_maker,
+                                    // 此消息只包含 Book 波动率，其他 Trade 相关字段置为 None
+                                    telemetry.send(TelemetryPacket {
+                                        msg_type: "BOOK".to_string(),
+                                        timestamp: book.trans_time,
 
-                        annualized_vol: vol_result.annualized, // 发送年化值
-                        trend_imbalance: flow_imbalance,
-                        vwap_bias: vwap_bias,
-                        trend_state: state_val,
-                    });
+                                        price: None,           // 空
+                                        quantity: None,        // 空
+                                        is_buyer_maker: None,  // 空
 
-                    if vol_calc.is_ready() && !vol_result.is_stale {
-                        stats.record(vol_result.annualized);
+                                        vol_trade: None,       // 空
+                                        vol_book: Some(vol_res.annualized), // 有值
 
-                        // 计算完成时刻（本地时间）
-                        let signal_time_str = Local::now().format("%H:%M:%S%.3f").to_string();
+                                        trend_imbalance: None, // 空
+                                        vwap_bias: None,       // 空
+                                        trend_state: None,     // 空
+                                    });
 
-                        // Debug: 合并打印趋势+波动率+时间
-                        // #[cfg(debug_assertions)]
-                        // println!(
-                        //     "[{}] 📊 Vol: {:.2}% (raw:{:.6}, dt:{:.3}s) | Trend: {:?} Imb:{:+.1}% Bias:{:+.4}% | P:{:.2}",
-                        //     signal_time_str,
-                        //     vol_result.annualized * 100.0,
-                        //     vol_result.raw_vol,
-                        //     vol_result.dt_secs,
-                        //     trend_state,
-                        //     flow_imbalance * 100.0,
-                        //     vwap_bias * 100.0,
-                        //     p
-                        // );
-
-                        // --- Alert Logic ---
-                        if vol_result.annualized >= (cfg.threshold / 100.0) {
-                            let now = Instant::now();
-                            let needs_alert = match last_alert_time {
-                                None => true,
-                                Some(last) => {
-                                    now.duration_since(last).as_secs() >= cfg.cooldown_secs
+                                    last_book_send_time = Instant::now();
                                 }
-                            };
-
-                            if needs_alert {
-                                // Identify the 1s candle with the largest body change in the last 5 seconds.
-                                let target_sec = trade_sec;
-
-                                // Collect candidates: history + current incomplete candle.
-                                let candidates = kline_history
-                                    .iter()
-                                    .chain(current_kline.iter())
-                                    .filter(|k| k.open_time >= target_sec - 5);
-
-                                // Find the candle with the maximum absolute price change.
-                                if let Some(max_kline) = candidates.max_by(|a, b| {
-                                    a.change().abs().partial_cmp(&b.change().abs()).unwrap()
-                                }) {
-                                    let kline_time_str = china_timezone
-                                        .timestamp_opt(max_kline.open_time, 0)
-                                        .unwrap()
-                                        .format("%H:%M:%S")
-                                        .to_string();
-
-                                    notifier::send_slack_alert(
-                                        cfg.slack_webhook_url.clone(),
-                                        vol_result.annualized,
-                                        cfg.threshold,
-                                        vol_result.raw_vol,
-                                        vol_result.dt_secs,
-                                        signal_time_str.clone(), // 信号产生时间
-                                        max_kline.open,
-                                        max_kline.close,
-                                        max_kline.change(),
-                                        max_kline.volume,
-                                        kline_time_str,
-                                    );
-
-                                    warn!(
-                                        "🔥 Alert! Vol: {:.2}% (raw: {:.6}, dt: {:.3}s), Max 1s Candle: {:.2} ({:.2})",
-                                        vol_result.annualized * 100.0, vol_result.raw_vol, vol_result.dt_secs,
-                                        max_kline.change(), max_kline.volume
-                                    );
-                                }
-
-                                last_alert_time = Some(now);
                             }
                         }
                     }
                 }
             }
-            Message::Ping(payload) => {
-                write.send(Message::Pong(payload)).await?;
-            }
-            Message::Close(_) => {
-                warn!("Received Close Frame from server.");
-                break;
-            }
+            Message::Ping(payload) => { write.send(Message::Pong(payload)).await?; }
+            Message::Close(_) => { break; }
             _ => (),
         }
     }

@@ -6,20 +6,23 @@ use tokio_tungstenite::accept_async;
 use tungstenite::Message;
 use tracing::{info, error, warn};
 
-// --- 数据包定义 (与之前一致) ---
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TelemetryPacket {
-    pub timestamp: u64,
-    // 去掉了 id
-    pub price: f64,
-    pub quantity: f64,
-    pub is_buyer_maker: bool,
+    pub msg_type: String,   // "TRADE" | "BOOK"
+    pub timestamp: u64,     // 事件发生的真实时间
 
-    // --- 新增指标 ---
-    pub annualized_vol: f64, // 年化波动率
-    pub trend_imbalance: f64,// 订单流不平衡
-    pub vwap_bias: f64,      // VWAP 偏离
-    pub trend_state: i8,     // 1=Bullish, -1=Bearish, 0=Neutral
+    // 使用 Option，如果是 None，JSON 中会显示为 null
+    pub price: Option<f64>,
+    pub quantity: Option<f64>,
+    pub is_buyer_maker: Option<bool>,
+
+    pub vol_trade: Option<f64>, // 只有 TRADE 消息带这个
+    pub vol_book: Option<f64>,  // 只有 BOOK 消息带这个
+
+    pub trend_imbalance: Option<f64>,
+    pub vwap_bias: Option<f64>,
+    pub trend_state: Option<i8>,
 }
 
 // --- 遥测服务 ---

@@ -14,6 +14,7 @@ pub struct VolatilityConfig {
     pub window_size: usize,         // 采样窗口大小（数据点数量），例如 30
     pub stale_threshold_ms: u64,    // 僵尸数据阈值（毫秒），例如 5000 = 5秒
     pub fallback_volatility: f64,   // 数据过期时返回的防御性波动率，例如 0.5 = 50%
+    pub expire_threshold_ms: u64,   // 价格序列过期清除阈值（毫秒），例如 5000 = 5秒
 }
 
 /// 趋势监控配置（基于 Order Flow Imbalance + VWAP 偏离度）
@@ -30,6 +31,9 @@ pub struct TrendConfig {
 pub struct MonitorConfig {
     // Maps directly to 'slack_webhook_url' in the YAML file.
     pub slack_webhook_url: String,
+    /// Slack 报警开关，false 时不发送任何 Slack 消息
+    #[serde(default = "default_slack_enabled")]
+    pub slack_enabled: bool,
 
     pub threshold: f64,
     pub cooldown_secs: u64,
@@ -56,4 +60,9 @@ impl MonitorConfig {
 
         Ok(config)
     }
+}
+
+/// 默认启用 Slack 报警
+fn default_slack_enabled() -> bool {
+    true
 }

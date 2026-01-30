@@ -13,10 +13,13 @@ volatility:
   window_size: 30           # 采样窗口大小（数据点数量）
   stale_threshold_ms: 5000  # 僵尸数据阈值（毫秒），5000 = 5秒无数据视为断流
   fallback_volatility: 0.5  # 数据过期时返回的防御性波动率，0.5 = 50%
+  expire_threshold_ms: 5000 # 价格序列过期清除阈值（毫秒），超过此时间的旧数据会被清除
 
 # Webhook Configuration
 # Replace the URL below with your actual Slack Webhook URL.
 slack_webhook_url: "https://hooks.slack.com/services/YOUR/REAL/WEBHOOK"
+# Slack 报警开关，设为 false 可禁用所有 Slack 消息发送
+slack_enabled: true
 
 # 趋势监控配置（基于 Order Flow Imbalance + VWAP 偏离度）
 trend:

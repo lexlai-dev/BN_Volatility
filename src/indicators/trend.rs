@@ -1,118 +1,61 @@
-// src/indicators/trend.rs
-
 use std::collections::VecDeque;
 use crate::models::AggTrade;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TrendState {
-    Bullish, // 看涨
-    Bearish, // 看跌
-    Neutral, // 震荡/中性
-}
+pub enum TrendState { Bullish, Bearish, Neutral }
 
 pub struct TrendIndicator {
-    // 窗口大小（例如最近 100 笔交易）
     window_size: usize,
-    // 历史交易缓存
     trades: VecDeque<TradeData>,
-    
-    // --- 滚动累加器 (O(1) 更新的关键) ---
-    // 累积主动买入量
     sum_buy_vol: f64,
-    // 累积主动卖出量
     sum_sell_vol: f64,
-    // 累积 (价格 * 数量)，用于算 VWAP
     sum_price_vol: f64,
-    // 累积总数量，用于算 VWAP
     sum_vol: f64,
-
-    // --- 阈值配置 ---
-    // Order Flow Imbalance 阈值，例如 0.15 表示净买入占比 > 15%
     imbalance_threshold: f64,
-    // VWAP 偏离度阈值，例如 0.0003 表示万分之三
     vwap_bias_threshold: f64,
-    // 最小成交量过滤，防止冷清时产生噪音信号
     min_volume: f64,
 }
 
-// 内部使用的简化结构，存我们需要的数据即可
-struct TradeData {
-    price: f64,
-    quantity: f64,
-    is_buyer_maker: bool,
-}
+struct TradeData { price: f64, quantity: f64, is_buyer_maker: bool }
 
 impl TrendIndicator {
     pub fn new(window_size: usize, imbalance_threshold: f64, vwap_bias_threshold: f64, min_volume: f64) -> Self {
         Self {
-            window_size,
-            trades: VecDeque::with_capacity(window_size),
-            sum_buy_vol: 0.0,
-            sum_sell_vol: 0.0,
-            sum_price_vol: 0.0,
-            sum_vol: 0.0,
-            imbalance_threshold,
-            vwap_bias_threshold,
-            min_volume,
+            window_size, trades: VecDeque::with_capacity(window_size),
+            sum_buy_vol: 0.0, sum_sell_vol: 0.0, sum_price_vol: 0.0, sum_vol: 0.0,
+            imbalance_threshold, vwap_bias_threshold, min_volume,
         }
     }
 
     pub fn update(&mut self, trade: &AggTrade) -> TrendState {
-        // 1. 解析数据 (把 String 转 f64，注意处理错误，这里简化为 unwrap)
         let price = trade.price.parse::<f64>().unwrap_or(0.0);
         let qty = trade.quantity.parse::<f64>().unwrap_or(0.0);
+        let is_sell = trade.is_buyer_maker;
         
-        // 2. 识别方向
-        // Binance 规则: is_buyer_maker = true -> Taker 是卖方 -> 主动卖出
-        let is_sell = trade.is_buyer_maker; 
-        
-        // 3. 添加新数据进累加器
-        if is_sell {
-            self.sum_sell_vol += qty;
-        } else {
-            self.sum_buy_vol += qty;
-        }
+        if is_sell { self.sum_sell_vol += qty; } else { self.sum_buy_vol += qty; }
         self.sum_price_vol += price * qty;
         self.sum_vol += qty;
 
-        // 4. 维护队列 (入队)
-        let new_data = TradeData { price, quantity: qty, is_buyer_maker: is_sell };
-        self.trades.push_back(new_data);
+        self.trades.push_back(TradeData { price, quantity: qty, is_buyer_maker: is_sell });
 
-        // 5. 维护窗口 (出队过期数据)
         if self.trades.len() > self.window_size {
-            if let Some(old_trade) = self.trades.pop_front() {
-                // 从累加器中减去旧数据
-                if old_trade.is_buyer_maker {
-                    self.sum_sell_vol -= old_trade.quantity;
-                } else {
-                    self.sum_buy_vol -= old_trade.quantity;
-                }
-                self.sum_price_vol -= old_trade.price * old_trade.quantity;
-                self.sum_vol -= old_trade.quantity;
+            if let Some(old) = self.trades.pop_front() {
+                if old.is_buyer_maker { self.sum_sell_vol -= old.quantity; } 
+                else { self.sum_buy_vol -= old.quantity; }
+                self.sum_price_vol -= old.price * old.quantity;
+                self.sum_vol -= old.quantity;
             }
         }
-
-        // 6. 计算指标并判断趋势
         self.calculate_trend(price)
     }
 
     fn calculate_trend(&self, current_price: f64) -> TrendState {
-        // 最小成交量过滤：防止在极度冷清时产生噪音信号
-        if self.sum_vol < self.min_volume {
-            return TrendState::Neutral;
-        }
+        if self.sum_vol < self.min_volume { return TrendState::Neutral; }
 
-        // --- 指标 A: Order Flow Imbalance (相对比例) ---
-        // 范围: -1.0 (全卖) 到 +1.0 (全买)
-        let net_vol = self.sum_buy_vol - self.sum_sell_vol;
-        let flow_imbalance = net_vol / self.sum_vol;
-        
-        // --- 指标 B: VWAP 偏离度 ---
+        let flow_imbalance = (self.sum_buy_vol - self.sum_sell_vol) / self.sum_vol;
         let vwap = self.sum_price_vol / self.sum_vol;
         let vwap_bias = (current_price - vwap) / vwap;
 
-        // --- 融合策略：资金流向 + 价格位置 共振 ---
         if flow_imbalance > self.imbalance_threshold && vwap_bias > self.vwap_bias_threshold {
             TrendState::Bullish
         } else if flow_imbalance < -self.imbalance_threshold && vwap_bias < -self.vwap_bias_threshold {
@@ -122,37 +65,13 @@ impl TrendIndicator {
         }
     }
 
-    /// 获取当前指标值，用于报警时展示
-    /// 返回: (flow_imbalance, vwap, vwap_bias)
     pub fn get_metrics(&self, current_price: f64) -> (f64, f64, f64) {
-        let net_vol = self.sum_buy_vol - self.sum_sell_vol;
-        let flow_imbalance = if self.sum_vol > 0.0 { net_vol / self.sum_vol } else { 0.0 };
+        let flow_imbalance = if self.sum_vol > 0.0 { (self.sum_buy_vol - self.sum_sell_vol) / self.sum_vol } else { 0.0 };
         let vwap = if self.sum_vol > 0.0 { self.sum_price_vol / self.sum_vol } else { current_price };
         let vwap_bias = if vwap > 0.0 { (current_price - vwap) / vwap } else { 0.0 };
         (flow_imbalance, vwap, vwap_bias)
     }
 
-    /// 获取窗口内的交易笔数
-    pub fn trade_count(&self) -> usize {
-        self.trades.len()
-    }
+    pub fn trade_count(&self) -> usize { self.trades.len() }
 
-    /// Debug: 打印窗口内所有交易数据到 console
-    pub fn debug_dump_trades(&self) {
-        println!("=== Trend Window Dump ({} trades) ===", self.trades.len());
-        println!("| {:>3} | {:>12} | {:>10} | {:>6} |", "#", "Price", "Qty", "Side");
-        println!("|-----|--------------|------------|--------|");
-        for (i, t) in self.trades.iter().enumerate() {
-            let side = if t.is_buyer_maker { "SELL" } else { "BUY" };
-            println!("| {:>3} | {:>12.2} | {:>10.6} | {:>6} |", i + 1, t.price, t.quantity, side);
-        }
-        println!("|-----|--------------|------------|--------|");
-        let net_vol = self.sum_buy_vol - self.sum_sell_vol;
-        let imbalance = if self.sum_vol > 0.0 { net_vol / self.sum_vol } else { 0.0 };
-        println!("| Buy: {:.6} | Sell: {:.6} | Imbalance: {:.2}% |",
-                 self.sum_buy_vol, self.sum_sell_vol, imbalance * 100.0);
-        let vwap = if self.sum_vol > 0.0 { self.sum_price_vol / self.sum_vol } else { 0.0 };
-        println!("| VWAP: {:.2} | Total Vol: {:.6} |", vwap, self.sum_vol);
-        println!("==========================================");
-    }
 }
