@@ -43,14 +43,7 @@ async fn main() {
 
     // Initialize the volatility calculator with config parameters.
     // Instantiated outside the loop to potentially preserve state across reconnections.
-    let mut vol_calc_trade = InstantVolatilityIndicator::new(
-        cfg.volatility.window_size,
-        cfg.volatility.stale_threshold_ms,
-        cfg.volatility.fallback_volatility,
-        cfg.volatility.expire_threshold_ms,
-    );
-
-    let mut vol_calc_book = InstantVolatilityIndicator::new(
+    let mut vol_calc = InstantVolatilityIndicator::new(
         cfg.volatility.window_size,
         cfg.volatility.stale_threshold_ms,
         cfg.volatility.fallback_volatility,
@@ -61,7 +54,7 @@ async fn main() {
         info!("🚀 Starting Binance Volatility Monitor...");
 
         // Run the core connection logic imported from the library.
-        if let Err(e) = run_connection(&mut vol_calc_trade, &mut vol_calc_book, &cfg).await {
+        if let Err(e) = run_connection(&mut vol_calc, &cfg).await {
             error!("⚠️ Connection lost: {:?}. Retrying in 5s...", e);
         }
 

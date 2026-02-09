@@ -10,18 +10,19 @@ use tracing::{info, error, warn};
 #[derive(Debug, Clone, Serialize)]
 pub struct TelemetryPacket {
     pub msg_type: String,   // "TRADE" | "BOOK"
-    pub timestamp: u64,     // 事件发生的真实时间
+    pub timestamp: u64,     // 事件时间
 
-    // 使用 Option，如果是 None，JSON 中会显示为 null
+    // --- 交易特有字段 (Book 消息通常为 None) ---
     pub price: Option<f64>,
     pub quantity: Option<f64>,
     pub is_buyer_maker: Option<bool>,
 
-    pub vol_trade: Option<f64>, // 只有 TRADE 消息带这个
-    pub vol_book: Option<f64>,  // 只有 BOOK 消息带这个
-
-    pub trend_imbalance: Option<f64>,
-    pub vwap_bias: Option<f64>,
+    // --- 通用指标字段 (根据 msg_type 决定其含义) ---
+    // 如果是 TRADE: 代表 Trade Vol, Flow Imbalance, VWAP Bias
+    // 如果是 BOOK:  代表 Book Vol,  Order Book Imbalance, WMP Bias
+    pub vol: Option<f64>,
+    pub imbalance: Option<f64>,
+    pub bias: Option<f64>,
     pub trend_state: Option<i8>,
 }
 
