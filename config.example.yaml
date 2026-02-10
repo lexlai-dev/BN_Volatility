@@ -1,30 +1,54 @@
 # Strategy Alert Parameters
-threshold: 40.0        # Annualized volatility threshold for alerts (%)
-cooldown_secs: 60      # Alert cooldown period in seconds
+threshold: 60.0        # Annualized volatility threshold for alerts (%)
+cooldown_secs: 15      # Alert cooldown period in seconds
 
 # Histogram Statistics Parameters
 histogram:
   interval: 21600      # Reporting interval in seconds (21600s = 6 hours)
-  step: 0.01           # Bucket step size (0.01 = 1%)
+  step: 0.1           # Bucket step size (0.01 = 1%)
   buckets: 200         # Total number of buckets
 
 # 波动率计算配置
 volatility:
-  window_size: 30           # 采样窗口大小（数据点数量）
+  window_size: 20           # 采样窗口大小（数据点数量）
   stale_threshold_ms: 5000  # 僵尸数据阈值（毫秒），5000 = 5秒无数据视为断流
   fallback_volatility: 0.5  # 数据过期时返回的防御性波动率，0.5 = 50%
   expire_threshold_ms: 5000 # 价格序列过期清除阈值（毫秒），超过此时间的旧数据会被清除
+  spread_adjust: 10.0       # 波动率报警时调大双边价差（美元）
 
 # Webhook Configuration
-# Replace the URL below with your actual Slack Webhook URL.
 slack_webhook_url: "https://hooks.slack.com/services/YOUR/REAL/WEBHOOK"
-# Slack 报警开关，设为 false 可禁用所有 Slack 消息发送
 slack_enabled: true
 
-# 趋势监控配置（基于 Order Flow Imbalance + VWAP 偏离度）
+# 趋势监控配置（基于价格拟合 + OFI）
 trend:
-  enabled: true
-  window_size: 100            # 滑动窗口大小（交易笔数）
-  imbalance_threshold: 0.15   # Order Flow Imbalance 阈值，0.15 = 净买入占比 > 15%
-  vwap_bias_threshold: 0.0003 # VWAP 偏离度阈值（万分之三 = 0.03%）
-  min_volume: 0.01            # 最小成交量过滤（BTC），防止冷清时噪音
+  # VWAP 参数
+  vwap_window_ms: 100         # VWAP 聚合窗口（毫秒）
+  vwap_series_max_len: 1000   # VWAP 序列最大长度
+  
+  # 拟合参数
+  fit_window_secs: 5.0        # 5秒拟合窗口（用于趋势判断）
+  fit_window_2s: 2.0          # 2秒拟合窗口（用于价格预测）
+  fit_min_points: 15          # 最少数据点
+  fit_min_r2: 0.80            # 最小 R²（拟合优度）
+  
+  # OFI 参数
+  ofi_cum_window_secs: 1.5    # OFI 累积窗口（秒）
+  ofi_decay: 0.8              # EMA 衰减因子
+  
+  # 信号阈值
+  slope_threshold: 4.0        # 斜率阈值（$/s）
+  ofi_confirm_threshold: 1.0  # OFI 确认阈值
+  
+  # 退出参数
+  slope_threshold_ratio: 0.25 # 斜率比例系数
+  min_price_fallback: 10.0    # 最小价格回落（$）
+  max_price_fallback: 35.0    # 最大价格回落（$）
+  entry_protection_secs: 1.0  # 入场保护期（秒）
+  slope_weak_threshold: 0.5   # 斜率不够明显的阈值
+  
+  # 预测参数
+  predict_horizon_secs: 1.0   # 预测时间范围（秒）
+  
+  # 冷却
+  cooldown_secs: 1.0          # 信号冷却期（秒）

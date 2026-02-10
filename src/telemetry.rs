@@ -7,23 +7,23 @@ use tungstenite::Message;
 use tracing::{info, error, warn};
 
 
+/// 遥测数据包 - 发送给 Python 客户端的价差调整信号
+/// 
+/// # 字段说明 (使用单字母以减少网络带宽)
+/// - `t`: 时间戳 (毫秒)
+/// - `s`: 信号来源 - "V"=高波动, "U"=上涨趋势, "D"=下跌趋势, "N"=无信号
+/// - `a`: ask 侧价差调整 (美元)
+/// - `b`: bid 侧价差调整 (美元)
 #[derive(Debug, Clone, Serialize)]
 pub struct TelemetryPacket {
-    pub msg_type: String,   // "TRADE" | "BOOK"
-    pub timestamp: u64,     // 事件时间
-
-    // --- 交易特有字段 (Book 消息通常为 None) ---
-    pub price: Option<f64>,
-    pub quantity: Option<f64>,
-    pub is_buyer_maker: Option<bool>,
-
-    // --- 通用指标字段 (根据 msg_type 决定其含义) ---
-    // 如果是 TRADE: 代表 Trade Vol, Flow Imbalance, VWAP Bias
-    // 如果是 BOOK:  代表 Book Vol,  Order Book Imbalance, WMP Bias
-    pub vol: Option<f64>,
-    pub imbalance: Option<f64>,
-    pub bias: Option<f64>,
-    pub trend_state: Option<i8>,
+    #[serde(rename = "t")]
+    pub timestamp: u64,
+    #[serde(rename = "s")]
+    pub source: String,
+    #[serde(rename = "a")]
+    pub ask_adjust: f64,
+    #[serde(rename = "b")]
+    pub bid_adjust: f64,
 }
 
 // --- 遥测服务 ---
